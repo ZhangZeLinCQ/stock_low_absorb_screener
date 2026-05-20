@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Downloaded/generated data
+data/kline/
+data/candidate_table.csv
+data/candidate_table.meta.json
+data/run_state.json
+
+# Output results
+output/*.csv
+output/*.md
+
+# Logs
+logs/*.log
+
+# Claude Code local config
+.claude/
