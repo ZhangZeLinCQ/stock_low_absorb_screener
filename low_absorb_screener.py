@@ -74,8 +74,15 @@ DEFAULT_MAX_20D_DROP_PCT = 0.0
 DEFAULT_MIN_DISTANCE_FROM_60D_LOW_PCT = 0.0
 DEFAULT_MAX_LATEST_VOLUME_PERCENTILE = 0.0
 DEFAULT_MIN_LOW_ABSORB_SCORE = 0.0
+DEFAULT_MIN_FINAL_SCORE = 0.0
 DEFAULT_MIN_REWARD_RISK_RATIO = 0.0
 DEFAULT_DOWN_DAY_MODE = "pct"
+# 研究报告增强：主题景气度与大盘环境过滤默认关闭，可通过参数打开。
+DEFAULT_THEME_CSV = "config/hot_theme_codes.csv"
+DEFAULT_THEME_SCORE_WEIGHT = 10.0
+DEFAULT_MIN_THEME_SCORE = 0.0
+DEFAULT_MARKET_FILTER = "off"
+DEFAULT_MARKET_INDEX_CODE = "000001"
 DEFAULT_WORKERS = 6
 DEFAULT_COMPUTE_WORKERS = 1
 DEFAULT_AFTER_HOUR = 16
@@ -92,6 +99,8 @@ class StockCandidate:
     total_market_cap_yi: float
     latest_price: float | None
     latest_trade_date: str
+    industry: str = ""
+    concepts: str = ""
 
 
 @dataclass(frozen=True)
@@ -118,6 +127,10 @@ class ScreenResult:
     code: str
     name: str
     market: str
+    industry: str
+    concepts: str
+    theme_tags: list[str]
+    theme_score: float
     total_market_cap_yi: float
     recent_window_days: int
     hit_days: int
@@ -153,6 +166,7 @@ class ScreenResult:
     target_price: float | None
     reward_risk_ratio: float | None
     low_absorb_score: float
+    final_score: float
     exhaustion_score: float
     shrink_score: float
     position_score: float
@@ -315,6 +329,53 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--theme-csv",
+        default=DEFAULT_THEME_CSV,
+        help=(
+            "主题股票池 CSV 路径，默认 config/hot_theme_codes.csv。"
+            "可包含列：股票代码、股票名称、主题标签、主题评分、备注。"
+        ),
+    )
+    parser.add_argument(
+        "--theme-score-weight",
+        type=float,
+        default=DEFAULT_THEME_SCORE_WEIGHT,
+        help=(
+            "主题评分纳入最终排序的权重，0-50。默认 10，表示最终评分=低吸评分90%%+主题评分10%%。"
+        ),
+    )
+    parser.add_argument(
+        "--min-theme-score",
+        type=float,
+        default=DEFAULT_MIN_THEME_SCORE,
+        help="最低主题景气度评分；0 表示不启用。适合只筛 AI算力/机器人/商业航天/工业母机等主线。",
+    )
+    parser.add_argument(
+        "--require-theme",
+        action="store_true",
+        help="只保留命中主题股票池或主题关键词的股票。",
+    )
+    parser.add_argument(
+        "--min-final-score",
+        type=float,
+        default=DEFAULT_MIN_FINAL_SCORE,
+        help="最低最终评分；0 表示不启用。最终评分会叠加主题景气度权重。",
+    )
+    parser.add_argument(
+        "--market-filter",
+        choices=("off", "ma20", "ma60", "ma20-and-ma60", "ma20-or-ma60"),
+        default=DEFAULT_MARKET_FILTER,
+        help=(
+            "大盘环境过滤。off=关闭；ma20=指数收盘站上20日线；ma60=站上60日线；"
+            "ma20-and-ma60=同时站上；ma20-or-ma60=至少站上一条。默认 off。"
+        ),
+    )
+    parser.add_argument(
+        "--market-index-code",
+        default=DEFAULT_MARKET_INDEX_CODE,
+        help="大盘过滤使用的指数代码，默认 000001 上证指数；也可用 399001 深证成指或 000300 沪深300。",
+    )
+    parser.add_argument(
         "--history-days",
         type=int,
         default=DEFAULT_HISTORY_DAYS,
@@ -421,6 +482,12 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--min-reward-risk-ratio 不能小于 0")
     if args.min_low_absorb_score < 0 or args.min_low_absorb_score > 100:
         parser.error("--min-low-absorb-score 必须在 0 到 100 之间")
+    if args.min_final_score < 0 or args.min_final_score > 100:
+        parser.error("--min-final-score 必须在 0 到 100 之间")
+    if args.theme_score_weight < 0 or args.theme_score_weight > 50:
+        parser.error("--theme-score-weight 必须在 0 到 50 之间")
+    if args.min_theme_score < 0 or args.min_theme_score > 100:
+        parser.error("--min-theme-score 必须在 0 到 100 之间")
     if args.history_days < args.lookback_days:
         parser.error("--history-days 不能小于 --lookback-days")
     if args.min_market_cap_yi <= 0:
@@ -440,6 +507,9 @@ def resolve_paths_and_dates(args: argparse.Namespace) -> None:
     args.candidate_output_path = Path(args.candidate_output)
     if not args.candidate_output_path.is_absolute():
         args.candidate_output_path = (PROJECT_DIR / args.candidate_output_path).resolve()
+    args.theme_csv_path = Path(args.theme_csv)
+    if not args.theme_csv_path.is_absolute():
+        args.theme_csv_path = (PROJECT_DIR / args.theme_csv_path).resolve()
 
     args.effective_end_date = resolve_effective_end_date(args)
     if args.output is None:
@@ -594,7 +664,7 @@ def fetch_candidate_table_via_eastmoney(min_market_cap_yi: float) -> list[StockC
             "invt": 2,
             "fid": "f20",
             "fs": "m:1+t:2,m:0+t:6,m:0+t:80",
-            "fields": "f12,f14,f20,f2,f26",
+            "fields": "f12,f14,f20,f2,f26,f100",
             "ut": EASTMONEY_QUOTE_UT,
         }
         payload = request_json_from_any(session, EASTMONEY_LIST_URLS, params=params)
@@ -621,6 +691,8 @@ def fetch_candidate_table_via_eastmoney(min_market_cap_yi: float) -> list[StockC
                 total_market_cap_yi=total_market_cap_yi,
                 latest_price=to_float(row.get("f2")),
                 latest_trade_date=format_eastmoney_date(row.get("f26")),
+                industry=str(row.get("f100") or "").strip(),
+                concepts="",
             )
 
         total = int(data.get("total") or 0)
@@ -640,6 +712,7 @@ def fetch_candidate_table_via_akshare(min_market_cap_yi: float) -> list[StockCan
     code_col = pick_dataframe_column(df, ("代码", "股票代码", "symbol"))
     name_col = pick_dataframe_column(df, ("名称", "股票名称", "name"))
     price_col = pick_dataframe_column(df, ("最新价", "最新", "价格", "latest"))
+    industry_col = pick_dataframe_column(df, ("所属行业", "行业", "industry"))
     market_cap_col = pick_dataframe_column(df, ("总市值", "总市值(亿元)", "总市值（亿元）"))
     if not code_col or not name_col or not market_cap_col:
         raise RuntimeError(f"AkShare 返回结果缺少必要列，实际列: {list(df.columns)}")
@@ -666,6 +739,8 @@ def fetch_candidate_table_via_akshare(min_market_cap_yi: float) -> list[StockCan
             total_market_cap_yi=total_market_cap_yi,
             latest_price=to_float(row.get(price_col)) if price_col else None,
             latest_trade_date=latest_trade_date,
+            industry=str(row.get(industry_col) or "").strip() if industry_col else "",
+            concepts="",
         )
 
     return sorted(candidates.values(), key=lambda item: item.total_market_cap_yi, reverse=True)
@@ -754,6 +829,8 @@ def parse_tencent_quote(quote_text: str, min_market_cap_yi: float) -> StockCandi
         total_market_cap_yi=total_market_cap_yi,
         latest_price=to_float(parts[3]) if len(parts) > 3 else None,
         latest_trade_date=latest_trade_date or f"{dt.datetime.now():%Y-%m-%d}",
+        industry="",
+        concepts="",
     )
 
 
@@ -801,6 +878,8 @@ def read_candidate_table(path: Path) -> list[StockCandidate]:
                     total_market_cap_yi=total_market_cap_yi,
                     latest_price=to_float(row.get("最新价")),
                     latest_trade_date=(row.get("行情日期") or "").strip(),
+                    industry=(row.get("所属行业") or "").strip(),
+                    concepts=(row.get("相关概念") or "").strip(),
                 )
             )
     return rows
@@ -815,6 +894,8 @@ def write_candidate_table(path: Path, rows: list[StockCandidate]) -> None:
                 "股票代码",
                 "股票名称",
                 "市场",
+                "所属行业",
+                "相关概念",
                 "总市值(亿元)",
                 "最新价",
                 "行情日期",
@@ -828,6 +909,8 @@ def write_candidate_table(path: Path, rows: list[StockCandidate]) -> None:
                     "股票代码": row.code,
                     "股票名称": row.name,
                     "市场": row.market,
+                    "所属行业": row.industry,
+                    "相关概念": row.concepts,
                     "总市值(亿元)": format_number(row.total_market_cap_yi, 2),
                     "最新价": format_number(row.latest_price, 3),
                     "行情日期": row.latest_trade_date,
@@ -1417,6 +1500,12 @@ def _screen_one_stock(
     latest_row = recent_rows[-1]
     pct_by_date = build_pct_change_by_date(rows)
 
+    theme_score, theme_tags = score_theme_relevance(stock, args)
+    if args.require_theme and theme_score <= 0:
+        return None
+    if args.min_theme_score > 0 and theme_score < args.min_theme_score:
+        return None
+
     # 1) 流动性过滤：市值大但成交额太低的票，容易出现“无人问津式地量”。
     latest_20_rows = lookback_rows[-min(20, len(lookback_rows)) :]
     avg_amount_20d_yi = average([row.amount for row in latest_20_rows]) / 100_000_000
@@ -1562,6 +1651,10 @@ def _screen_one_stock(
     if args.min_low_absorb_score > 0 and low_absorb_score < args.min_low_absorb_score:
         return None
 
+    final_score = combine_final_score(low_absorb_score, theme_score, args.theme_score_weight)
+    if args.min_final_score > 0 and final_score < args.min_final_score:
+        return None
+
     suggested_status = classify_low_absorb_status(
         low_absorb_score=low_absorb_score,
         confirm_signal=confirm_signal,
@@ -1575,6 +1668,10 @@ def _screen_one_stock(
         code=stock.code,
         name=stock.name,
         market=stock.market,
+        industry=stock.industry,
+        concepts=stock.concepts,
+        theme_tags=theme_tags,
+        theme_score=theme_score,
         total_market_cap_yi=stock.total_market_cap_yi,
         recent_window_days=len(recent_rows),
         hit_days=len(hit_rows),
@@ -1610,6 +1707,7 @@ def _screen_one_stock(
         target_price=target_price,
         reward_risk_ratio=reward_risk_ratio,
         low_absorb_score=low_absorb_score,
+        final_score=final_score,
         exhaustion_score=score_detail["卖盘枯竭评分"],
         shrink_score=score_detail["整体缩量评分"],
         position_score=score_detail["位置安全评分"],
@@ -1662,6 +1760,7 @@ def select_low_absorb_stocks(
     return sorted(
         results,
         key=lambda item: (
+            -item.final_score,
             -item.low_absorb_score,
             -item.hit_days,
             max(item.hit_green_percentiles),
@@ -1700,6 +1799,166 @@ def average(values: list[float | int]) -> float:
         return 0.0
     return sum(cleaned) / len(cleaned)
 
+
+
+
+def load_theme_map(path: Path) -> dict[str, dict[str, Any]]:
+    """Load a user-maintainable hot-theme map.
+
+    Supported columns: 股票代码, 股票名称, 主题标签, 主题评分, 备注.
+    The file is optional. Missing file means no hard-code theme override.
+    """
+    if not path.exists():
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    with path.open("r", newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            code = normalize_stock_code(row.get("股票代码") or row.get("code") or "")
+            if not code:
+                continue
+            tags = split_theme_tags(row.get("主题标签") or row.get("tags") or "")
+            score = to_float(row.get("主题评分") or row.get("score"))
+            result[code] = {
+                "name": (row.get("股票名称") or row.get("name") or "").strip(),
+                "tags": tags,
+                "score": clamp(score if score is not None else 80.0),
+                "note": (row.get("备注") or row.get("note") or "").strip(),
+            }
+    return result
+
+
+def normalize_stock_code(value: object) -> str:
+    text = str(value or "").strip()
+    match = re.search(r"(\d{6})", text)
+    return match.group(1) if match else ""
+
+
+def split_theme_tags(text: str) -> list[str]:
+    tags: list[str] = []
+    for item in re.split(r"[,，/、;；|\s]+", text or ""):
+        item = item.strip()
+        if item and item not in tags:
+            tags.append(item)
+    return tags
+
+
+HOT_THEME_KEYWORDS: tuple[tuple[str, tuple[str, ...], float], ...] = (
+    ("AI算力", ("算力", "AI服务器", "服务器", "数据中心", "液冷", "CPO", "光模块", "光通信", "PCB", "高速铜缆", "交换机", "电源"), 90.0),
+    ("存储芯片", ("存储", "DRAM", "NAND", "HBM", "半导体", "国产芯片", "封测", "先进封装", "半导体设备"), 88.0),
+    ("人形机器人", ("机器人", "人形机器人", "减速器", "伺服", "电机", "传感器", "丝杠", "控制器"), 86.0),
+    ("工业母机", ("工业母机", "数控机床", "机床", "刀具", "高端装备", "通用设备", "新型工业化"), 82.0),
+    ("商业航天", ("商业航天", "卫星互联网", "航天", "北斗", "军工电子", "低空经济", "大飞机", "无人机"), 84.0),
+    ("国产替代", ("国产替代", "信创", "自主可控", "国产软件", "华为", "鸿蒙", "操作系统"), 78.0),
+)
+
+
+def score_theme_relevance(stock: StockCandidate, args: argparse.Namespace) -> tuple[float, list[str]]:
+    """Score whether a stock belongs to current high-prosperity themes.
+
+    This is deliberately a soft score. It should improve ranking and allow
+    optional filtering, but it must not replace the price-volume signal.
+    """
+    tags: list[str] = []
+    score = 0.0
+    theme_map: dict[str, dict[str, Any]] = getattr(args, "theme_map", {}) or {}
+    mapped = theme_map.get(stock.code)
+    if mapped:
+        score = max(score, float(mapped.get("score") or 80.0))
+        for tag in mapped.get("tags") or []:
+            if tag not in tags:
+                tags.append(tag)
+
+    haystack = " ".join([stock.name, stock.industry, stock.concepts]).upper()
+    for tag, keywords, keyword_score in HOT_THEME_KEYWORDS:
+        for keyword in keywords:
+            if keyword.upper() in haystack:
+                score = max(score, keyword_score)
+                if tag not in tags:
+                    tags.append(tag)
+                break
+
+    return round(clamp(score), 2), tags
+
+
+def combine_final_score(low_absorb_score: float, theme_score: float, theme_weight: float) -> float:
+    weight = clamp(theme_weight, 0.0, 50.0) / 100.0
+    return round(low_absorb_score * (1 - weight) + theme_score * weight, 2)
+
+
+def index_secid_for_code(code: str) -> str:
+    code = normalize_stock_code(code)
+    if code.startswith("399"):
+        return f"0.{code}"
+    return f"1.{code}"
+
+
+def index_name_for_code(code: str) -> str:
+    names = {"000001": "上证指数", "399001": "深证成指", "000300": "沪深300"}
+    return names.get(normalize_stock_code(code), f"指数{code}")
+
+
+def update_market_index_cache(args: argparse.Namespace) -> None:
+    if args.market_filter == "off":
+        return
+    code = normalize_stock_code(args.market_index_code)
+    if not code:
+        raise RuntimeError("--market-index-code 必须包含 6 位指数代码")
+    history_begin = args.effective_end_date - dt.timedelta(days=args.history_days + 14)
+    index_stock = StockCandidate(
+        code=code,
+        name=index_name_for_code(code),
+        market="指数",
+        secid=index_secid_for_code(code),
+        total_market_cap_yi=0.0,
+        latest_price=None,
+        latest_trade_date="",
+        industry="指数",
+        concepts="大盘环境",
+    )
+    args.kline_dir_path.mkdir(parents=True, exist_ok=True)
+    try:
+        _code, _rows, status = update_one_kline(
+            index_stock,
+            args.kline_dir_path,
+            history_begin,
+            args.effective_end_date,
+            args.force_kline_update,
+        )
+        print(f"大盘指数缓存 {index_stock.name}({code}) {status}。")
+    except Exception as exc:
+        raise RuntimeError(f"大盘环境过滤需要指数日线，但 {code} 更新失败: {exc}") from exc
+
+
+def market_filter_passed(args: argparse.Namespace) -> tuple[bool, str]:
+    if args.market_filter == "off":
+        return True, "未启用大盘过滤"
+    code = normalize_stock_code(args.market_index_code)
+    rows = read_kline_csv(kline_path(args.kline_dir_path, code))
+    rows = [row for row in rows if row.trade_date <= args.effective_end_date]
+    if len(rows) < 60:
+        return False, f"{index_name_for_code(code)} 可用日线不足 60 条，无法做大盘过滤"
+    latest = rows[-1]
+    ma20 = moving_average(rows, 20)
+    ma60 = moving_average(rows, 60)
+    above20 = ma20 is not None and latest.close_price >= ma20
+    above60 = ma60 is not None and latest.close_price >= ma60
+    mode = args.market_filter
+    if mode == "ma20":
+        ok = above20
+    elif mode == "ma60":
+        ok = above60
+    elif mode == "ma20-and-ma60":
+        ok = above20 and above60
+    elif mode == "ma20-or-ma60":
+        ok = above20 or above60
+    else:
+        ok = True
+    msg = (
+        f"{index_name_for_code(code)} {latest.trade_date:%Y-%m-%d} 收盘 {latest.close_price:.2f}，"
+        f"MA20={ma20:.2f}，MA60={ma60:.2f}，过滤模式={mode}，结果={'通过' if ok else '未通过'}"
+    )
+    return ok, msg
 
 def moving_average(rows: list[KlineRow], days: int) -> float | None:
     if len(rows) < days:
@@ -1955,6 +2214,10 @@ def result_fieldnames() -> list[str]:
         "股票代码",
         "股票名称",
         "市场",
+        "所属行业",
+        "相关概念",
+        "主题标签",
+        "主题评分",
         "总市值(亿元)",
         "最近窗口交易日数",
         "命中天数",
@@ -1978,6 +2241,7 @@ def result_fieldnames() -> list[str]:
         "距60日低点(%)",
         "确认信号",
         "低吸综合评分",
+        "最终评分",
         "建议状态",
         "卖盘枯竭评分",
         "整体缩量评分",
@@ -2009,6 +2273,10 @@ def result_to_dict(row: ScreenResult) -> dict[str, str | int]:
         "股票代码": row.code,
         "股票名称": row.name,
         "市场": row.market,
+        "所属行业": row.industry,
+        "相关概念": row.concepts,
+        "主题标签": " / ".join(row.theme_tags),
+        "主题评分": format_number(row.theme_score, 2),
         "总市值(亿元)": format_number(row.total_market_cap_yi, 2),
         "最近窗口交易日数": row.recent_window_days,
         "命中天数": row.hit_days,
@@ -2034,6 +2302,7 @@ def result_to_dict(row: ScreenResult) -> dict[str, str | int]:
         "距60日低点(%)": format_number(row.distance_from_60d_low_pct, 2),
         "确认信号": row.confirm_signal,
         "低吸综合评分": format_number(row.low_absorb_score, 2),
+        "最终评分": format_number(row.final_score, 2),
         "建议状态": row.suggested_status,
         "卖盘枯竭评分": format_number(row.exhaustion_score, 2),
         "整体缩量评分": format_number(row.shrink_score, 2),
@@ -2108,6 +2377,13 @@ def write_run_state(args: argparse.Namespace, candidates_count: int, results_cou
                 "require_price_above_ma20": args.require_price_above_ma20,
                 "min_reward_risk_ratio": args.min_reward_risk_ratio,
                 "min_low_absorb_score": args.min_low_absorb_score,
+                "min_final_score": args.min_final_score,
+                "theme_csv": str(args.theme_csv_path),
+                "theme_score_weight": args.theme_score_weight,
+                "min_theme_score": args.min_theme_score,
+                "require_theme": args.require_theme,
+                "market_filter": args.market_filter,
+                "market_index_code": args.market_index_code,
                 "history_days": args.history_days,
                 "min_market_cap_yi": args.min_market_cap_yi,
                 "candidate_count": candidates_count,
@@ -2180,10 +2456,23 @@ def main() -> int:
         print("候选表为空，请检查数据源或筛选条件。", file=sys.stderr)
         return 1
 
+    args.theme_map = load_theme_map(args.theme_csv_path)
+    if args.theme_map:
+        print(f"已加载主题股票池 {args.theme_csv_path}，共 {len(args.theme_map)} 条。")
+    else:
+        print("未加载到主题股票池，仅使用股票名称/行业/概念关键词进行主题评分。")
+
     if args.force_renormalize:
         renormalize_all_klines(args.kline_dir_path)
-    update_kline_cache(args, candidates)
-    results = select_low_absorb_stocks(args, candidates)
+    update_market_index_cache(args)
+    market_ok, market_msg = market_filter_passed(args)
+    print(f"大盘过滤：{market_msg}")
+    if not market_ok:
+        print("大盘环境未通过过滤，本次输出空结果。")
+        results = []
+    else:
+        update_kline_cache(args, candidates)
+        results = select_low_absorb_stocks(args, candidates)
     write_results(args.output_path, results)
     copy_latest_outputs(args.output_path, results)
     write_run_state(args, len(candidates), len(results))
